@@ -1,15 +1,17 @@
 #include <iostream>
+#include <memory>
+#include <vector>
 #include <vtk-9.0/vtkNew.h>
 #include <vtk-9.0/vtkImageData.h>
 #include <vtk-9.0/vtkNIFTIImageReader.h>
 #include <vtk-9.0/vtkPNGWriter.h>
-#include "NvOnnxParser.h"
+#include <vtk-9.0/vtkNIFTIImageWriter.h>
+
 #include "buffers.h"
 #include "NvInfer.h"
-#include <vector>
 #include "cuda_runtime_api.h"
 
-#include <memory>
+
 
 class Logger : public nvinfer1::ILogger
 {
@@ -27,15 +29,40 @@ class OnnxUNet
 
 private:
     common::Params mParam;
-    int nSlice = 100;
+    vtkNew<vtkNIFTIImageReader> reader;
+    vtkNew<vtkImageData> result;
+    int nSlice = 0;
+    int maxSlice;
+    short minHU, maxHU;
+    float mean, std;
+    long int inputSize;
+    std::vector<short> input;
+    std::vector<uint8_t> output;
 
 public:
     nvinfer1::ICudaEngine *mEngine;
-    OnnxUNet(const common::Params &param) : mParam(param), mEngine(nullptr) {}
+    OnnxUNet(const common::Params &param) : mParam(param), mEngine(nullptr)
+    {
+        reader->SetFileName(param.imagePath.c_str());
+        reader->Update();
+        result->SetDimensions(reader->GetOutput()->GetDimensions());
+        result->AllocateScalars(VTK_UNSIGNED_CHAR, 1);
+        result->SetSpacing(reader->GetOutput()->GetSpacing());
+        result->SetOrigin(reader->GetOutput()->GetOrigin());
+        maxSlice = reader->GetOutput()->GetDimensions()[2];
+        minHU = param.minHU;
+        maxHU = param.maxHU;
+        std = param.std;
+        mean = param.mean;
+        inputSize = param.inputH * param.inputW;
+        input.resize(inputSize);
+        output.resize(inputSize);
+    }
     bool deserialize();
     bool processInput(const BufferManager &buffers);
     bool verifyOutput(const BufferManager &buffers);
     bool infer();
+    bool write();
 };
 
 bool OnnxUNet::deserialize()
@@ -60,36 +87,31 @@ bool OnnxUNet::infer()
     auto context = UniquePtr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
     if (!context)
         return false;
-    if (!processInput(buffers))
-        return false;
-    buffers.copyInputToDevice();
-    bool status = context->executeV2(buffers.getDeviceBindings().data());
-    if (!status)
-        return false;
-    buffers.copyOutputToHost();
-    if(!verifyOutput(buffers))
-        return false;
+    for (nSlice; nSlice < maxSlice; nSlice++)
+    {
+        if (!processInput(buffers))
+            return false;
+        buffers.copyInputToDevice();
+        bool status = context->executeV2(buffers.getDeviceBindings().data());
+        if (!status)
+            return false;
+        buffers.copyOutputToHost();
+        if (!verifyOutput(buffers))
+            return false;
+    }
+
     return true;
 }
 
 bool OnnxUNet::processInput(const BufferManager &buffers)
 {
-    vtkNew<vtkNIFTIImageReader> reader;
-    reader->SetFileName(mParam.imagePath.c_str());
-    reader->Update();
-    short minHU = mParam.minHU;
-    short maxHU = mParam.maxHU;
-    const long int inputSize = mParam.inputH * mParam.inputW;
-    std::vector<short> fileData(inputSize);
     short *pixel = static_cast<short *>(reader->GetOutput()->GetScalarPointer(0, 0, nSlice));
-    for (int i = 0; i < inputSize; i++)
-        fileData[i] = *pixel++;
-    nSlice++;
     float *hostDataBuffer = static_cast<float *>(buffers.getHostBuffer(mParam.inputTensorName));
     for (int i = 0; i < inputSize; i++)
     {
-        fileData[i] = fileData[i] > maxHU ? maxHU : (fileData[i] < minHU ? minHU : fileData[i]);
-        hostDataBuffer[i] = float((fileData[i] - mParam.mean) / mParam.std);
+        input[i] = *pixel++;
+        input[i] = input[i] > maxHU ? maxHU : (input[i] < minHU ? minHU : input[i]);
+        hostDataBuffer[i] = float((input[i] - mean) / std);
         //std::cout << hostDataBuffer[i] << std::endl;
     }
     return true;
@@ -97,27 +119,25 @@ bool OnnxUNet::processInput(const BufferManager &buffers)
 
 bool OnnxUNet::verifyOutput(const BufferManager &buffers)
 {
-    const long int outputSize = mParam.inputH*mParam.inputW;
-    float*ptr = static_cast<float*>(buffers.getHostBuffer(mParam.outputTensorName));
-    uint8_t output[outputSize];
-    vtkNew<vtkImageData>mask;
-    mask->SetDimensions(512,512,1);
-    mask->AllocateScalars(VTK_UNSIGNED_CHAR,1);
-    uint8_t* pixel = static_cast<uint8_t*>(mask->GetScalarPointer(0,0,0));
+    float *ptr = static_cast<float *>(buffers.getHostBuffer(mParam.outputTensorName));
+    uint8_t *pixel = static_cast<uint8_t *>(result->GetScalarPointer(0, 0, nSlice));
 
-    for (int i=0;i<outputSize;i++)
+    for (int i = 0; i < inputSize; i++)
     {
-        ptr[i] = 1/(1+exp(-ptr[i]));
-        output[i] = ptr[i]>=0.5?255:0;
+        ptr[i] = 1 / (1 + exp(-ptr[i]));
+        output[i] = ptr[i] >= 0.5 ? 255 : 0;
         *pixel++ = output[i];
     }
+    return true;
+}
 
-    vtkNew<vtkPNGWriter>writer;
-    writer->SetFileName("output.png");
-    writer->SetInputData(mask);
+bool OnnxUNet::write()
+{
+    vtkNew<vtkNIFTIImageWriter> writer;
+    writer->SetFileName("output.nii.gz");
+    writer->SetInputData(result);
     writer->Update();
     writer->Write();
-    return true;
 }
 
 int main(int, char **)
@@ -126,5 +146,6 @@ int main(int, char **)
     common::Params param;
     OnnxUNet UNet(param);
     UNet.deserialize();
-    std::cout<<UNet.infer()<<std::endl;
+    std::cout << UNet.infer() << std::endl;
+    UNet.write();
 }

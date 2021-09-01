@@ -8,6 +8,9 @@ enable_testing()
 set(VTK_DIR "/home/jianjia/VTK-9.0.3/build")
 find_package(VTK REQUIRED)
 include(${VTK_USE_FILE})
+message("VTK_VERSION:${VTK_VERSION}")
+message("VTK_LIBRARIES:${VTK_LIBRARIES}")
+message("VTK_INCLUDE_DIRS:${VTK_INCLUDE_DIRS}")
 
 # TensorRT
 include_directories("./include")
